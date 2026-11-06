@@ -242,6 +242,15 @@ def main():
     ap.add_argument("--outdir", type=str, default="results_bbd_dagma_nb")
     ap.add_argument("--consensus_k", type=int, default=None, help="k for k-of-S state consensus backbone")
     ap.add_argument("--save_plots", action="store_true", help="save heatmaps and network plots (true vs estimated)")
+    ap.add_argument("--boot", action="store_true", help="fit bootstrap refits by resampling rows within each state")
+    ap.add_argument("--n_boot", type=int, default=1, help="number of bootstrap refits when --boot is used")
+    ap.add_argument("--boot_seed", type=int, default=None, help="bootstrap RNG seed; defaults to --seed")
+    ap.add_argument(
+        "--boot_edge_thresh",
+        type=float,
+        default=None,
+        help="edge threshold for bootstrap selection frequencies; defaults to --thresh",
+    )
     ap.add_argument(
         "--raw_txt",
         type=str,
@@ -290,6 +299,10 @@ def main():
         lam_fused=args.lam_fused,
         fused_pairs=fused_pairs,
         verbose=True,
+        boot=args.boot,
+        n_boot=args.n_boot,
+        boot_seed=args.boot_seed if args.boot_seed is not None else args.seed,
+        boot_edge_thresh=args.boot_edge_thresh if args.boot_edge_thresh is not None else args.thresh,
     )
 
     outdir = Path(args.outdir)
@@ -306,6 +319,7 @@ def main():
     metrics = {
         "raw_txt": [str(p) for p in raw_files] if raw_files is not None else None,
         "state_labels": data_labels,
+        "bootstrap": None,
         "backbone": None,
         "backbone_score": None,
         "backbone_is_dag": bool(is_dag_from_weight(W0, thresh=args.thresh)),
@@ -333,6 +347,15 @@ def main():
             m = {"auprc": None, "is_dag": bool(is_dag_from_weight(Ws[k], thresh=args.thresh))}
             metrics["states"][str(k)] = m
 
+    if model.bootstrap_ is not None:
+        boot = model.bootstrap_
+        metrics["bootstrap"] = {
+            "n_boot": int(boot["n_boot"]),
+            "edge_thresh": float(boot["edge_thresh"]),
+            "method": str(boot["method"]),
+            "boot_seed": boot["boot_seed"],
+        }
+
     with open(outdir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
@@ -343,6 +366,20 @@ def main():
     np.save(outdir / "W_backbone_est.npy", W0)
     np.save(outdir / "B_backbone_consensus_and.npy", B_consensus_and)
     np.save(outdir / f"B_backbone_consensus_k{k_majority}.npy", B_consensus_k)
+    if model.bootstrap_ is not None:
+        boot = model.bootstrap_
+        np.save(outdir / "W0_bootstrap.npy", boot["W0"])
+        np.save(outdir / "W_states_bootstrap.npy", boot["W_states"])
+        np.save(outdir / "Delta_bootstrap.npy", boot["Delta"])
+        np.save(outdir / "W0_mean.npy", boot["W0_mean"])
+        np.save(outdir / "W0_sd.npy", boot["W0_sd"])
+        np.save(outdir / "W_states_mean.npy", boot["W_states_mean"])
+        np.save(outdir / "W_states_sd.npy", boot["W_states_sd"])
+        np.save(outdir / "Delta_mean.npy", boot["Delta_mean"])
+        np.save(outdir / "Delta_sd.npy", boot["Delta_sd"])
+        np.save(outdir / "W0_selection_freq.npy", boot["W0_selection_freq"])
+        np.save(outdir / "W_states_selection_freq.npy", boot["W_states_selection_freq"])
+        np.save(outdir / "Delta_selection_freq.npy", boot["Delta_selection_freq"])
     for k in range(args.states):
         np.save(outdir / f"W_state{k}_est.npy", Ws[k])
         if raw_files is None:

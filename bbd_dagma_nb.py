@@ -1,7 +1,7 @@
 import math
 import random
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 try:
     import igraph as ig
@@ -24,6 +24,84 @@ class SimulationData:
 
 def _offdiag_mask(d: int, device=None) -> torch.Tensor:
     return ~torch.eye(d, dtype=torch.bool, device=device)
+
+
+def _prepare_offsets(
+    offsets: Optional[List[torch.Tensor]],
+    X_states: List[torch.Tensor],
+    device,
+) -> Optional[List[torch.Tensor]]:
+    if offsets is None:
+        return None
+    if len(offsets) != len(X_states):
+        raise ValueError("offsets must have one tensor per state")
+
+    out = []
+    for k, (offset, X) in enumerate(zip(offsets, X_states)):
+        off = offset.to(device).reshape(-1)
+        if off.numel() != X.shape[0]:
+            raise ValueError(
+                f"offsets[{k}] has length {off.numel()}, expected {int(X.shape[0])}"
+            )
+        out.append(off)
+    return out
+
+
+def _bootstrap_resample_states(
+    X_states: List[torch.Tensor],
+    offsets: Optional[List[torch.Tensor]] = None,
+    rng: np.random.Generator = None,
+) -> Tuple[List[torch.Tensor], Optional[List[torch.Tensor]], List[np.ndarray]]:
+    rng = np.random.default_rng() if rng is None else rng
+    x_boot = []
+    offset_boot = [] if offsets is not None else None
+    indices = []
+
+    for k, X in enumerate(X_states):
+        n = int(X.shape[0])
+        if n < 1:
+            raise ValueError(f"Cannot bootstrap state {k}; it has no rows")
+        idx_np = rng.integers(0, n, size=n, dtype=np.int64)
+        idx = torch.tensor(idx_np, dtype=torch.long, device=X.device)
+        x_boot.append(X.index_select(0, idx).clone())
+        if offsets is not None:
+            offset_boot.append(offsets[k].index_select(0, idx).clone())
+        indices.append(idx_np)
+
+    return x_boot, offset_boot, indices
+
+
+def _summarize_bootstrap(
+    w0_arr: np.ndarray,
+    ws_arr: np.ndarray,
+    delta_arr: np.ndarray,
+    alpha_arr: np.ndarray,
+    theta_arr: np.ndarray,
+    edge_thresh: float,
+    indices: List[List[np.ndarray]],
+) -> Dict[str, object]:
+    edge_thresh = float(edge_thresh)
+    return {
+        "n_boot": int(w0_arr.shape[0]),
+        "edge_thresh": edge_thresh,
+        "indices": indices,
+        "W0": w0_arr,
+        "W_states": ws_arr,
+        "Delta": delta_arr,
+        "alpha": alpha_arr,
+        "theta": theta_arr,
+        "W0_mean": w0_arr.mean(axis=0),
+        "W0_sd": w0_arr.std(axis=0),
+        "W_states_mean": ws_arr.mean(axis=0),
+        "W_states_sd": ws_arr.std(axis=0),
+        "Delta_mean": delta_arr.mean(axis=0),
+        "Delta_sd": delta_arr.std(axis=0),
+        "alpha_mean": alpha_arr.mean(axis=0),
+        "theta_mean": theta_arr.mean(axis=0),
+        "W0_selection_freq": (np.abs(w0_arr) >= edge_thresh).mean(axis=0),
+        "W_states_selection_freq": (np.abs(ws_arr) >= edge_thresh).mean(axis=0),
+        "Delta_selection_freq": (np.abs(delta_arr) >= edge_thresh).mean(axis=0),
+    }
 
 
 def random_order_dag(
@@ -173,6 +251,8 @@ class MultiStateBackboneDAGMA_NB(nn.Module):
         super().__init__()
         self.d = d
         self.s = n_states
+        self.init_scale = init_scale
+        self.bootstrap_ = None
         rnd = lambda *shape: torch.randn(*shape, device=device) * init_scale
 
         self.W0 = nn.Parameter(rnd(d, d))
@@ -259,6 +339,113 @@ class MultiStateBackboneDAGMA_NB(nn.Module):
             fused = fused + (self.Delta[b] - self.Delta[a]).abs()[mask].sum()
         return fused
 
+    def _new_bootstrap_model(self):
+        return type(self)(
+            d=self.d,
+            n_states=self.s,
+            init_scale=self.init_scale,
+            device=str(self.W0.device),
+        ).to(self.W0.device)
+
+    def _load_bootstrap_means(self, summary: Dict[str, object], ref_idx: int = None):
+        device = self.W0.device
+        dtype = self.W0.dtype
+        with torch.no_grad():
+            self.W0.copy_(torch.tensor(summary["W0_mean"], dtype=dtype, device=device))
+            self.Delta.copy_(torch.tensor(summary["Delta_mean"], dtype=dtype, device=device))
+            self.alpha.copy_(torch.tensor(summary["alpha_mean"], dtype=dtype, device=device))
+            self.theta.copy_(torch.tensor(summary["theta_mean"], dtype=dtype, device=device))
+            self._zero_diag_()
+            if ref_idx is not None:
+                self.Delta[int(ref_idx)].zero_()
+
+    def _fit_bootstrap(
+        self,
+        method: str,
+        X_states: List[torch.Tensor],
+        offsets: Optional[List[torch.Tensor]],
+        n_boot: int,
+        boot_seed: int,
+        boot_edge_thresh: float,
+        verbose: bool,
+        fit_kwargs: Dict[str, object],
+        ref_idx: int = None,
+    ):
+        n_boot = int(n_boot)
+        if n_boot < 1:
+            raise ValueError("n_boot must be positive when boot=True")
+
+        X_states = [x.to(self.W0.device) for x in X_states]
+        offsets = _prepare_offsets(offsets, X_states, self.W0.device)
+        rng = np.random.default_rng(boot_seed)
+
+        w0_arr = np.zeros((n_boot, self.d, self.d), dtype=np.float32)
+        ws_arr = np.zeros((n_boot, self.s, self.d, self.d), dtype=np.float32)
+        delta_arr = np.zeros((n_boot, self.s, self.d, self.d), dtype=np.float32)
+        alpha_arr = np.zeros((n_boot, self.s, self.d), dtype=np.float32)
+        theta_arr = np.zeros((n_boot, self.s, self.d), dtype=np.float32)
+        boot_indices = []
+
+        for b in range(n_boot):
+            xb, ob, idx = _bootstrap_resample_states(X_states, offsets=offsets, rng=rng)
+            boot_indices.append(idx)
+
+            if boot_seed is not None:
+                seed_b = int(boot_seed) + 100003 * (b + 1)
+                torch.manual_seed(seed_b)
+                if self.W0.device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_b)
+
+            model = self._new_bootstrap_model()
+            if method == "fit":
+                model.fit(
+                    xb,
+                    offsets=ob,
+                    verbose=False,
+                    boot=False,
+                    **fit_kwargs,
+                )
+            elif method == "fit_reference_delta":
+                model.fit_reference_delta(
+                    xb,
+                    ref_idx=int(ref_idx),
+                    offsets=ob,
+                    verbose=False,
+                    boot=False,
+                    **fit_kwargs,
+                )
+            else:
+                raise ValueError(f"Unsupported bootstrap method: {method}")
+
+            w0_arr[b] = model.W0.detach().cpu().numpy()
+            ws_arr[b] = np.stack(
+                [model.W_state(k).detach().cpu().numpy() for k in range(self.s)],
+                axis=0,
+            )
+            delta_arr[b] = model.Delta.detach().cpu().numpy()
+            alpha_arr[b] = model.alpha.detach().cpu().numpy()
+            theta_arr[b] = model.theta.detach().cpu().numpy()
+
+            if verbose and ((b + 1) % max(1, n_boot // 10) == 0 or b == 0):
+                print(f"[bootstrap] {b + 1}/{n_boot}", flush=True)
+
+        summary = _summarize_bootstrap(
+            w0_arr=w0_arr,
+            ws_arr=ws_arr,
+            delta_arr=delta_arr,
+            alpha_arr=alpha_arr,
+            theta_arr=theta_arr,
+            edge_thresh=boot_edge_thresh,
+            indices=boot_indices,
+        )
+        summary["method"] = method
+        summary["boot_seed"] = None if boot_seed is None else int(boot_seed)
+        if ref_idx is not None:
+            summary["ref_idx"] = int(ref_idx)
+        self.bootstrap_ = summary
+        self._load_bootstrap_means(summary, ref_idx=ref_idx)
+        return self
+
     def fit(
         self,
         X_states: List[torch.Tensor],
@@ -279,10 +466,42 @@ class MultiStateBackboneDAGMA_NB(nn.Module):
         mu_decay: float = 0.2,
         mu_decay_per: int = 500,
         verbose: bool = True,
+        boot: bool = False,
+        n_boot: int = 1,
+        boot_seed: int = None,
+        boot_edge_thresh: float = 0.3,
     ):
+        if boot:
+            return self._fit_bootstrap(
+                method="fit",
+                X_states=X_states,
+                offsets=offsets,
+                n_boot=n_boot,
+                boot_seed=boot_seed,
+                boot_edge_thresh=boot_edge_thresh,
+                verbose=verbose,
+                fit_kwargs={
+                    "max_iter": max_iter,
+                    "lr": lr,
+                    "lam_l1": lam_l1,
+                    "lam_w0": lam_w0,
+                    "lam_state": lam_state,
+                    "lam_delta": lam_delta,
+                    "lam_center": lam_center,
+                    "lam_group": lam_group,
+                    "lam_fused": lam_fused,
+                    "state_order": state_order,
+                    "fused_pairs": fused_pairs,
+                    "dagma_s": dagma_s,
+                    "mu0": mu0,
+                    "mu_decay": mu_decay,
+                    "mu_decay_per": mu_decay_per,
+                },
+            )
+
+        self.bootstrap_ = None
         X_states = [x.to(self.W0.device) for x in X_states]
-        if offsets is not None:
-            offsets = [o.to(self.W0.device) for o in offsets]
+        offsets = _prepare_offsets(offsets, X_states, self.W0.device)
         opt = torch.optim.AdamW(self.parameters(), lr=lr, betas=(0.9, 0.99))
         lam_w0_eff = lam_l1 if lam_w0 is None else lam_w0
         lam_state_eff = lam_l1 if lam_state is None else lam_state
@@ -328,6 +547,117 @@ class MultiStateBackboneDAGMA_NB(nn.Module):
 
         return self
 
+    def group_penalty_excluding_ref(self, ref_idx: int) -> torch.Tensor:
+        use_ids = [k for k in range(self.s) if k != ref_idx]
+        if len(use_ids) == 0:
+            return torch.tensor(0.0, device=self.W0.device)
+        ws = torch.stack([self.W_state(k) for k in use_ids], dim=0)
+        g = torch.sqrt((ws * ws).sum(dim=0) + 1e-8)
+        d = self.d
+        mask = ~torch.eye(d, dtype=torch.bool, device=self.W0.device)
+        return g[mask].sum()
+
+    def fit_reference_delta(
+        self,
+        x_states: List[torch.Tensor],
+        ref_idx: int,
+        offsets: List[torch.Tensor] = None,
+        max_iter: int = 2000,
+        lr: float = 3e-3,
+        lam_l1: float = 5e-3,
+        lam_w0: float = None,
+        lam_state: float = None,
+        lam_delta: float = 1e-2,
+        lam_group: float = 5e-3,
+        dagma_s: float = 1.0,
+        mu0: float = 1.0,
+        mu_decay: float = 0.2,
+        mu_decay_per: int = 500,
+        verbose: bool = True,
+        boot: bool = False,
+        n_boot: int = 1,
+        boot_seed: int = None,
+        boot_edge_thresh: float = 0.3,
+    ):
+        if boot:
+            return self._fit_bootstrap(
+                method="fit_reference_delta",
+                X_states=x_states,
+                offsets=offsets,
+                n_boot=n_boot,
+                boot_seed=boot_seed,
+                boot_edge_thresh=boot_edge_thresh,
+                verbose=verbose,
+                fit_kwargs={
+                    "max_iter": max_iter,
+                    "lr": lr,
+                    "lam_l1": lam_l1,
+                    "lam_w0": lam_w0,
+                    "lam_state": lam_state,
+                    "lam_delta": lam_delta,
+                    "lam_group": lam_group,
+                    "dagma_s": dagma_s,
+                    "mu0": mu0,
+                    "mu_decay": mu_decay,
+                    "mu_decay_per": mu_decay_per,
+                },
+                ref_idx=ref_idx,
+            )
+
+        self.bootstrap_ = None
+        x_states = [x.to(self.W0.device) for x in x_states]
+        offsets = _prepare_offsets(offsets, x_states, self.W0.device)
+
+        opt = torch.optim.AdamW(self.parameters(), lr=lr, betas=(0.9, 0.99))
+        lam_w0_eff = lam_l1 if lam_w0 is None else lam_w0
+        lam_state_eff = lam_l1 if lam_state is None else lam_state
+        mu = mu0
+
+        for t in range(max_iter):
+            opt.zero_grad()
+            nll = 0.0
+            h = 0.0
+            l1_state = 0.0
+            for k, xk in enumerate(x_states):
+                if k == ref_idx:
+                    wk = self.W0 - torch.diag(torch.diag(self.W0))
+                else:
+                    wk = self.W_state(k)
+                offk = offsets[k] if offsets is not None else None
+                nll = nll - self.nb_loglik(xk, wk, self.alpha[k], self.theta[k], offset=offk)
+                h = h + self.acyclicity_logdet(wk, s=dagma_s)
+                l1_state = l1_state + wk.abs().sum()
+
+            use_ids = [k for k in range(self.s) if k != ref_idx]
+            if len(use_ids) > 0:
+                delta_reg = self.Delta[use_ids].abs().sum()
+            else:
+                delta_reg = torch.tensor(0.0, device=self.W0.device)
+            reg = (
+                lam_w0_eff * self.W0.abs().sum()
+                + lam_state_eff * l1_state
+                + lam_delta * delta_reg
+                + lam_group * self.group_penalty_excluding_ref(ref_idx=ref_idx)
+            )
+            loss = mu * (nll + reg) + h
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+            opt.step()
+
+            with torch.no_grad():
+                self._zero_diag_()
+                self.Delta[ref_idx].zero_()
+
+            if (t + 1) % mu_decay_per == 0:
+                mu *= mu_decay
+
+            if verbose and ((t + 1) % max(50, max_iter // 20) == 0 or t == 0):
+                print(
+                    f"iter={t+1} loss={loss.item():.3f} "
+                    f"nll={float(nll):.3f} h={float(h):.3f} reg={float(reg):.3f} mu={mu:.4f}"
+                )
+
+        return self
 
 def edge_metrics(B_true: np.ndarray, W_est: np.ndarray, thresh: float = 0.3) -> Dict[str, float]:
     Bp = (np.abs(W_est) > thresh).astype(np.float32)
